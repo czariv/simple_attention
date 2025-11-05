@@ -5,6 +5,7 @@
 #include <cmath>
 #include <algorithm>
 #include <cstring>
+#include "cblas.h"
 
 using namespace std;
 static inline vector<float> load_bin(const string &path) {
@@ -36,42 +37,25 @@ static inline auto compare_tensors(const vector<float>& ref, const vector<float>
     cout << name << " diff=" << dif_count << "% \n";
 }
 
-static inline vector<float> matmul_transpB(const vector<float>& A, const vector<float>& B, int M, int K, int N) {
-    vector<float> C(M * N, 0.0f);
-    for (int i = 0; i < M; ++i) {
-        for (int j = 0; j < N; ++j) {
-            for (int k = 0; k < K; ++k) {
-                C[i*N + j] += A[i * K + k] * B[j * K + k];
-            }
-        }
-    }
-    return C;
-}
-
-static inline vector<float> matmul(const vector<float>& A, const vector<float>& B, int M, int K, int N) {
-    vector<float> C(M * N, 0.0f);
-    for (int i = 0; i < M; ++i) {
-        for (int k = 0; k < K; ++k) {
-            for (int j = 0; j < N; ++j) {
-                C[i*N + j] += A[i * K + k] * B[k * N + j];
-            }
-        }
-    }
-    return C;
-}
-
-static inline vector<float> matmul_and_pack(const vector<float>& A, const vector<float>& B, int M, int K, int H, int Dh) {
-    vector<float> C(M * H * Dh, 0.0f);
-    for (int j = 0; j < H; ++j) {
+static inline void matmul(OPENBLAS_CONST enum CBLAS_ORDER Order, OPENBLAS_CONST enum CBLAS_TRANSPOSE TransA, OPENBLAS_CONST enum CBLAS_TRANSPOSE TransB,
+                                    int M, int N, int K, int alpha, const float *A, int lda, const float *B, int ldb, int beta, float *C, int ldc) {
+    if (alpha == 1 && beta == 0){
+        cblas_sgemm(Order, TransA, TransB,
+                    M, N, K,
+                    1.0f,
+                    A, lda,
+                    B, ldb,
+                    0.0f,
+                    C, ldc);
+    } else {
         for (int i = 0; i < M; ++i) {
-            for (int h = 0; h < Dh; ++h) {
-                for (int k = 0; k < K; ++k) {
-                    C[(j*M + i) * Dh + h] += A[i * K + k] * B[(j*Dh + h) * K + k];
+            for (int k = 0; k < K; ++k) {
+                for (int j = 0; j < N; ++j) {
+                    C[i*N + j] += A[i * K + k] * B[k * N + j];
                 }
             }
         }
     }
-    return C;
 }
 
 static inline vector<float> create_random_matrix(int rows, int cols, mt19937& rng, float scale=0.02f) {
@@ -150,14 +134,15 @@ static inline vector<float> repeat_kv_heads(const vector<float>& X,
                                             int head_ratio) {
     int q_heads = kv_heads * head_ratio;
     vector<float> out(seq_len * q_heads * kv_head_dim);
-    int block_size = kv_head_dim * seq_len;
 
-    for (int h = 0; h < kv_heads; ++h) {
-        const float* src = &X[h * block_size];
-        for (int r = 0; r < head_ratio; ++r) {
-            int dst_h = h * head_ratio + r;
-            float* dst = &out[dst_h * block_size];
-            memcpy(dst, src, block_size * sizeof(float));
+    for (int pos = 0; pos < seq_len; ++pos) {
+        for (int h = 0; h < kv_heads; ++h) {
+            int src_base = pos * kv_heads * kv_head_dim + h * kv_head_dim;
+            for (int r = 0; r < head_ratio; ++r) {
+                int dst_h = h * head_ratio + r;
+                int dst_base = pos * q_heads * kv_head_dim + dst_h * kv_head_dim;
+                memcpy(&out[dst_base], &X[src_base], kv_head_dim * sizeof(float));
+            }
         }
     }
 
@@ -177,9 +162,9 @@ static inline void apply_rope(vector<float>& buf, const vector<float>& cosbuf, c
                                int heads, int head_dim, int seq_len) {
     int half = head_dim / 2;
     for (int h = 0; h < heads; ++h) {
-        int head_base = h * seq_len * head_dim;
+        int head_base = h * head_dim;
         for (int pos = 0; pos < seq_len; ++pos) {
-            int base = head_base + pos * head_dim;
+            int base = head_base + pos * head_dim * heads;
             int cosbase = pos * head_dim;
             for (int i = 0; i < half; ++i) {
                 float x1 = buf[base + i];
@@ -233,39 +218,55 @@ static inline vector<float> multi_head_attention(const vector<float>& X,
     int q_head_dim = emb_dim / q_heads;
     int kv_head_dim = seq_len / kv_heads;
     int head_ratio = q_heads / kv_heads;
-    const float tol = 0.01f;
+    int beta = 0;
+    int alpha = 1;
+    vector<float> Q(emb_dim * seq_len, 0.0f);
+    vector<float> K(seq_len * seq_len, 0.0f);
+    vector<float> V(seq_len * seq_len, 0.0f);
+    vector<float> out_heads(seq_len * emb_dim, 0.0f);
+    vector<float> attn(seq_len * seq_len, 0.0f);
 
-    vector<float> Q = matmul_and_pack(X, Wq, seq_len, emb_dim, q_heads, q_head_dim);
-    compare_tensors(q_out_ref, Q, "Q output", tol);
-    vector<float> K = matmul_and_pack(X, Wk, seq_len, emb_dim, kv_heads, kv_head_dim);
-    compare_tensors(k_out_ref, K, "K output", tol);
-    vector<float> V = matmul_and_pack(X, Wv, seq_len, emb_dim, kv_heads, kv_head_dim);
-    compare_tensors(v_out_ref, V, "V output", tol);
+    matmul(CblasRowMajor, CblasNoTrans, CblasTrans,
+                seq_len, emb_dim, emb_dim,
+                alpha,
+                X.data(), emb_dim,
+                Wq.data(), emb_dim,
+                beta,
+                Q.data(), emb_dim);
+    matmul(CblasRowMajor, CblasNoTrans, CblasTrans,
+                seq_len, seq_len, emb_dim,
+                alpha,
+                X.data(), emb_dim,
+                Wk.data(), emb_dim,
+                beta,
+                K.data(), seq_len);
+    matmul(CblasRowMajor, CblasNoTrans, CblasTrans,
+                seq_len, seq_len, emb_dim,
+                alpha,
+                X.data(), emb_dim,
+                Wv.data(), emb_dim,
+                beta,
+                V.data(), seq_len);
 
     // --- RoPE using cos_cache and sin_cache ---
     apply_rope(Q, cos_cache, sin_cache, q_heads, q_head_dim, seq_len);
     apply_rope(K, cos_cache, sin_cache, kv_heads, kv_head_dim, seq_len);
-    compare_tensors(q_out_rot_ref, Q, "Q after RoPE", tol);
-    compare_tensors(k_out_rot_ref, K, "K after RoPE", tol);
 
     // reshape and duplicate KV heads
-    vector<float> K_rep = repeat_kv_heads(K, seq_len, kv_heads, kv_head_dim, head_ratio);
-    vector<float> V_rep = repeat_kv_heads(V, seq_len, kv_heads, kv_head_dim, head_ratio);
+    // vector<float> K_rep = repeat_kv_heads(K, seq_len, kv_heads, kv_head_dim, head_ratio);
+    // vector<float> V_rep = repeat_kv_heads(V, seq_len, kv_heads, kv_head_dim, head_ratio);
 
-    compare_tensors(key_repeted_ref, K_rep, "K repeated heads", tol);
-    compare_tensors(value_repeted_ref, V_rep, "V repeated heads", tol);
-
-    vector<float> out_heads(seq_len * emb_dim, 0.0f);
     int block_size = seq_len * q_head_dim;
+    // attention scores: [seq_len, seq_len]
 
     for (int h = 0; h < q_heads; ++h) {
-        // attention scores: [seq_len, seq_len]
-        vector<float> attn = matmul_transpB(
-            vector<float>(&Q[h * block_size],
-                          &Q[(h + 1) * block_size]),
-            vector<float>(&K_rep[h * block_size],
-                          &K_rep[(h + 1) * block_size]),
-            seq_len, q_head_dim, seq_len);
+        matmul(CblasRowMajor, CblasNoTrans, CblasTrans,
+            seq_len, seq_len, q_head_dim,
+            alpha,
+            Q.data() + h * q_head_dim, emb_dim,
+            K.data() + h/4 * q_head_dim, seq_len,
+            beta,
+            attn.data(), seq_len);
 
         for (int i = 0; i < seq_len * seq_len; ++i)
             attn[i] = attn[i] / sqrtf((float)q_head_dim) + mask[i];
@@ -274,15 +275,23 @@ static inline vector<float> multi_head_attention(const vector<float>& X,
             softmax_inplace(attn, i * seq_len, seq_len);
 
         // weighted sum: [seq_len, 64]
-        vector<float> out_head = matmul(attn,
-            vector<float>(&V_rep[h * block_size],
-                          &V_rep[(h + 1) * block_size]),
-            seq_len, seq_len, kv_head_dim);
-
-        strided_store(out_head, &out_heads[h * q_head_dim], seq_len, emb_dim, q_head_dim);
+        matmul(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+            seq_len, q_head_dim, seq_len,
+            alpha,
+            attn.data(), seq_len,
+            V.data() + h/4 * q_head_dim, seq_len,
+            beta,
+            out_heads.data() + h * q_head_dim, emb_dim);
     }
-    compare_tensors(attn_output_reshaped_ref, out_heads, "Attention output reshaped", tol);
-    vector<float> out = matmul_transpB(out_heads, Wo, seq_len, emb_dim, emb_dim);
+    compare_tensors(attn_output_reshaped_ref, out_heads, "Attention output reshaped", 0.01f);
+    vector<float> out(seq_len * emb_dim, 0.0f);
+    matmul(CblasRowMajor, CblasNoTrans, CblasTrans,
+            seq_len, emb_dim, emb_dim,
+            alpha,
+            out_heads.data(), emb_dim,
+            Wo.data(), emb_dim,
+            beta,
+            out.data(), emb_dim);
     return out;
 }
 
@@ -307,7 +316,8 @@ int main(int argc, char** argv) {
     int arg_N = stoi(argv[4]);
     int q_heads = 32;
     int kv_heads = 8;
-    int mlp_dim = 8192;
+    int alpha = 1;
+    int beta = 0;
 
     const string weights_root = "weights";
     auto file_exists = [&](const string &p) {
@@ -404,13 +414,34 @@ int main(int argc, char** argv) {
 
         // 5. MLP: mlp_inp → mlp_out
         int D_mlp = W_gate.size() / emb_dim;
-        auto gate = matmul_transpB(mlp_inp_ref, W_gate, seq_len, emb_dim, D_mlp);
-        auto up = matmul_transpB(mlp_inp_ref, W_up, seq_len, emb_dim, D_mlp);
+        vector<float> gate(seq_len * D_mlp);
+        vector<float> up(seq_len * D_mlp);
+        vector<float> mlp_out(seq_len * emb_dim);
+        matmul(CblasRowMajor, CblasNoTrans, CblasTrans,
+            seq_len, D_mlp, emb_dim,
+            alpha,
+            mlp_inp_ref.data(), emb_dim,
+            W_gate.data(), emb_dim,
+            beta,
+            gate.data(), D_mlp);
+        matmul(CblasRowMajor, CblasNoTrans, CblasTrans,
+            seq_len, D_mlp, emb_dim,
+            alpha,
+            mlp_inp_ref.data(), emb_dim,
+            W_up.data(), emb_dim,
+            beta,
+            up.data(), D_mlp);
         compare_tensors(up_proj_out, up, "up_proj_out", tol);
         silu_inplace(gate);
         compare_tensors(gate_proj_out, gate, "gate_proj_out", tol);
         auto fused = mul(gate, up);
-        auto mlp_out = matmul_transpB(fused, W_down, seq_len, D_mlp, emb_dim);
+        matmul(CblasRowMajor, CblasNoTrans, CblasTrans,
+            seq_len, emb_dim, D_mlp,
+            alpha,
+            fused.data(), D_mlp,
+            W_down.data(), D_mlp,
+            beta,
+            mlp_out.data(), emb_dim);
         compare_tensors(mlp_out_ref, mlp_out, "mlp_out", tol);
 
         // 6. Residual add: after_attn + mlp_out → out

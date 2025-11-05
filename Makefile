@@ -1,7 +1,7 @@
 CC          = g++
-CFLAGS      = -Og -g -fopenmp -mavx512f -Iinclude
-LIBDIR      = include
-LDFLAGS     = -L$(LIBDIR) -lgemm -lm -fopenmp
+CFLAGS      = -g -fopenmp -mavx512f -Ilib/include
+LIBDIR      = lib/lib
+LDFLAGS     = -L$(LIBDIR) -lopenblas -lm -fopenmp
 
 SRCS        = $(wildcard *.cpp)
 OBJS        = $(SRCS:.cpp=.o)
