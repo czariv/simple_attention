@@ -1,7 +1,7 @@
 CC          = g++
-CFLAGS      = -g -fopenmp -mavx512f -Ilib/include
-LIBDIR      = lib/lib
-LDFLAGS     = -L$(LIBDIR) -lopenblas -lm -fopenmp
+CFLAGS      = -g -fopenmp -march=skylake-avx512 -Iinclude
+LIBDIR      = include
+LDFLAGS     = -L$(LIBDIR) -lgemm -lm -fopenmp
 
 SRCS        = $(wildcard *.cpp)
 OBJS        = $(SRCS:.cpp=.o)

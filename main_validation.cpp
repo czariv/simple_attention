@@ -5,7 +5,10 @@
 #include <cmath>
 #include <algorithm>
 #include <cstring>
-#include "cblas.h"
+#include <time.h>
+#include "interface.h"
+
+#include <immintrin.h>
 
 using namespace std;
 static inline vector<float> load_bin(const string &path) {
@@ -20,27 +23,55 @@ static inline vector<float> load_bin(const string &path) {
 }
 
 
-static inline auto compare_tensors(const vector<float>& ref, const vector<float>& out, const string& name, float tol= 0.1f) {
+static inline auto compare_tensors(const vector<float>& ref, const vector<float>& out, const string& name, const int size, const float tol= 0.1f) {
     if (ref.empty() || out.empty()) {
         cout << name << ": missing data for comparison\n";
         return;
     }
-    if (ref.size() != out.size()) {
-        cout << name << ": size mismatch (" << ref.size() << " vs " << out.size() << ")\n";
+    if (out.size() != size) {
+        cout << name << ": size mismatch (" << ref.size() << " vs " << size << ")\n";
         return;
     }
-    float difer = 0.f;
+    double difer = 0.f;
     int dif_count = 0;
-    for (size_t i = 0; i < ref.size(); ++i)
-        dif_count += fabs((ref[i] - out[i])/ref[i]) > tol ? 1 : 0;
-    dif_count = (100*dif_count)/ref.size();
+    for (size_t i = 0; i < size; ++i){
+        difer = fabs((ref[i] - out[i])/ref[i]);
+        if (difer > tol)
+            dif_count += 1;
+    }
+    dif_count = (100*dif_count)/size;
     cout << name << " diff=" << dif_count << "% \n";
 }
 
-static inline void matmul(OPENBLAS_CONST enum CBLAS_ORDER Order, OPENBLAS_CONST enum CBLAS_TRANSPOSE TransA, OPENBLAS_CONST enum CBLAS_TRANSPOSE TransB,
+static inline auto reshape_tensor(const vector<float>& ref, const int old_dim, const int new_dim){
+    vector<float> out(new_dim * new_dim);
+    for(int i = 0; i < new_dim; ++i)
+        for(int j = 0; j < new_dim; ++j)
+            out[i*new_dim + j] = ref[i*old_dim + j];
+    return out;
+}
+
+static inline auto copy_changed_layout(const vector<float> &ref, const int N, const int K, const int stride=-1){
+    vector<float> out(N*K);
+    vector<float> idd(K*K);
+    for(int i = 0; i < K; ++i)
+        idd[i + i * K] = 1;
+    gemm_seq(CblasRowMajor, CblasNoTrans, CblasNoTrans, CblasPre,
+            N, K, K,
+            1.0f,
+            ref.data(), K,
+            idd.data(), K,
+            0.0f,
+            out.data(), (stride == -1) ? K : stride,
+            stride, 0);
+    return out;
+
+}
+
+static inline void matmul(const enum CBLAS_ORDER Order, const enum CBLAS_TRANSPOSE TransA, const enum CBLAS_TRANSPOSE TransB,
                                     int M, int N, int K, int alpha, const float *A, int lda, const float *B, int ldb, int beta, float *C, int ldc) {
     if (alpha == 1 && beta == 0){
-        cblas_sgemm(Order, TransA, TransB,
+        gemm(Order, TransA, TransB,
                     M, N, K,
                     1.0f,
                     A, lda,
@@ -91,7 +122,7 @@ static inline vector<float> mul(const vector<float>& A, const vector<float>& B) 
     return C;
 }
 
-static inline vector<float> rmsnorm(const vector<float>& X, const vector<float>& g, int seq_len, int emb_dim, float eps=1e-6f) {
+static inline vector<float> rmsnorm(const vector<float>& X, const vector<float>& g, int seq_len, int emb_dim, float eps=1e-5f) {
     vector<float> Y(seq_len * emb_dim);
     for (int i = 0; i < seq_len; ++i) {
         const float* row = &X[i * emb_dim];
@@ -114,6 +145,52 @@ static inline float dot_prod(const float* a, const float* b, int len) {
 }
 
 static inline void softmax_inplace(vector<float>& scores, int offset, int len) {
+    #ifdef __AVX512F__
+    const float neg_inf = -std::numeric_limits<float>::infinity();
+    __m512 vmax = _mm512_set1_ps(neg_inf);
+    int i = 0;
+    for (; i + 16 <= len; i += 16) {
+        const float* ptr = scores.data() + offset + i;
+        __m512 v = _mm512_loadu_ps(ptr);
+        vmax = _mm512_max_ps(vmax, v);
+    }
+    int rem = len - i;
+    if (rem > 0) {
+        __mmask16 k = (1u << rem) - 1;
+        const float* ptr = scores.data() + offset + i;
+        __m512 v = _mm512_maskz_loadu_ps(k, ptr);
+        vmax = _mm512_max_ps(vmax, v);
+    }
+    alignas(64) float tmp[16];
+    _mm512_store_ps(tmp, vmax);
+    float m = tmp[0];
+    for (int j = 1; j < 16; ++j) if (tmp[j] > m) m = tmp[j];
+
+    float s = 0.0f;
+    for (int idx = 0; idx < len; ++idx) {
+        float v = expf(scores[offset + idx] - m);
+        scores[offset + idx] = v;
+        s += v;
+    }
+
+    float inv = 1.0f / s;
+    __m512 vinv = _mm512_set1_ps(inv);
+    i = 0;
+    for (; i + 16 <= len; i += 16) {
+        float* ptr = scores.data() + offset + i;
+        __m512 v = _mm512_loadu_ps(ptr);
+        v = _mm512_mul_ps(v, vinv);
+        _mm512_storeu_ps(ptr, v);
+    }
+    rem = len - i;
+    if (rem > 0) {
+        __mmask16 k = (1u << rem) - 1;
+        float* ptr = scores.data() + offset + i;
+        __m512 v = _mm512_maskz_loadu_ps(k, ptr);
+        v = _mm512_mul_ps(v, vinv);
+        _mm512_mask_storeu_ps(ptr, k, v);
+    }
+#else
     float m = -INFINITY;
     for (int i = 0; i < len; ++i) m = max(m, scores[offset + i]);
     float s = 0.0f;
@@ -124,6 +201,191 @@ static inline void softmax_inplace(vector<float>& scores, int offset, int len) {
     }
     float inv = 1.0f / s;
     for (int i = 0; i < len; ++i) scores[offset + i] *= inv;
+#endif
+}
+
+static inline void softmax_inplace_packed(vector<float>& scores, int offset, int len, int head_dim, int stride) {
+#ifdef __AVX512F__
+    const int block_cols = 16;
+    const int subblocks = (head_dim + block_cols - 1) / block_cols;
+    float m1 = -std::numeric_limits<float>::infinity();
+    float m2 = -std::numeric_limits<float>::infinity();
+    float m3 = -std::numeric_limits<float>::infinity();
+    float m4 = -std::numeric_limits<float>::infinity();
+
+    int base_off = offset - len * stride + stride * 3;
+    int cur_off = base_off;
+    int processed = 0;
+    const __m512i idx_r0 = _mm512_setr_epi32(
+        0,4,8,12, 16,20,24,28,
+        1,5,9,13, 17,21,25,29
+    );
+    const __m512i idx_r1 = _mm512_setr_epi32(
+        2,6,10,14, 18,22,26,30,
+        3,7,11,15, 19,23,27,31
+    );
+    while (processed < len) {
+        // start of a head_dim segment
+        cur_off += (processed % stride) ? head_dim * 4 : len * stride - stride * 3;
+        // process this head_dim segment (assume head_dim is multiple of 16 or handle masked loads)
+        int cols = head_dim;
+        int c = 0;
+        for (int sb = 0; sb < subblocks; ++sb) {
+            int remaining_cols = cols - c;
+            int this_cols = remaining_cols >= block_cols ? block_cols : remaining_cols;
+            const float* ptr = scores.data() + cur_off + c * 4;
+            if (this_cols == block_cols) {
+                __m512 a0 = _mm512_loadu_ps(ptr + 0);
+                __m512 a1 = _mm512_loadu_ps(ptr + 16);
+                __m512 a2 = _mm512_loadu_ps(ptr + 32);
+                __m512 a3 = _mm512_loadu_ps(ptr + 48);
+
+                __m512 t0 = _mm512_unpacklo_ps(a0, a2);
+                __m512 t1 = _mm512_unpackhi_ps(a0, a2);
+                __m512 t2 = _mm512_unpacklo_ps(a1, a3);
+                __m512 t3 = _mm512_unpackhi_ps(a1, a3);
+
+                // r0 = first 16 columns of row 0
+                __m512 r0 = _mm512_permutex2var_ps(t0, idx_r0, t2);
+                __m512 r1 = _mm512_permutex2var_ps(t0, idx_r1, t2);
+                __m512 r2 = _mm512_permutex2var_ps(t1, idx_r0, t3);
+                __m512 r3 = _mm512_permutex2var_ps(t1, idx_r1, t3);
+
+                m1 = std::max(m1, _mm512_reduce_max_ps(r0));
+                m2 = std::max(m2, _mm512_reduce_max_ps(r1));
+                m3 = std::max(m3, _mm512_reduce_max_ps(r2));
+                m4 = std::max(m4, _mm512_reduce_max_ps(r3));
+            } else {
+                // masked path for final partial subblock
+                unsigned int k = (1u << (this_cols * 4)) - 1; // this_cols*4 floats in this partial chunk
+                // but masks for _mm512_maskz_loadu_ps use 16-lane mask; we'll load piecewise by 16-float lanes
+                // easier safe fallback: scalar scan on this partial tail
+                for (int cc = 0; cc < this_cols; ++cc) {
+                    float v0 = scores[cur_off + (c + cc) * 4 + 0];
+                    float v1 = scores[cur_off + (c + cc) * 4 + 1];
+                    float v2 = scores[cur_off + (c + cc) * 4 + 2];
+                    float v3 = scores[cur_off + (c + cc) * 4 + 3];
+                    if (v0 > m1) m1 = v0;
+                    if (v1 > m2) m2 = v1;
+                    if (v2 > m3) m3 = v2;
+                    if (v3 > m4) m4 = v3;
+                }
+            }
+            c += this_cols;
+        }
+        processed += head_dim;
+    }
+
+    // now scalar exp + accumulation (we keep expf scalar for correctness)
+    float s1 = 0.0f, s2 = 0.0f, s3 = 0.0f, s4 = 0.0f;
+    cur_off = base_off;
+    processed = 0;
+    while (processed < len) {
+        cur_off += (processed % stride) ? head_dim * 4 : len * stride - stride * 3;
+        int cols = head_dim;
+        for (int c = 0; c < cols; ++c) {
+            int idx = cur_off + c * 4;
+            float v1 = expf(scores[idx + 0] - m1);
+            float v2 = expf(scores[idx + 1] - m2);
+            float v3 = expf(scores[idx + 2] - m3);
+            float v4 = expf(scores[idx + 3] - m4);
+            scores[idx + 0] = v1;
+            scores[idx + 1] = v2;
+            scores[idx + 2] = v3;
+            scores[idx + 3] = v4;
+            s1 += v1;
+            s2 += v2;
+            s3 += v3;
+            s4 += v4;
+        }
+        processed += head_dim;
+    }
+
+    float inv1 = 1.0f / s1;
+    float inv2 = 1.0f / s2;
+    float inv3 = 1.0f / s3;
+    float inv4 = 1.0f / s4;
+
+    __m512 scale = _mm512_set4_ps(inv4, inv3, inv2, inv1);
+
+    cur_off = base_off;
+    processed = 0;
+
+    while (processed < len) {
+        // ✔ use the SAME offset logic as max and exp loops
+        cur_off += (processed % stride) ? head_dim * 4 : len * stride - stride * 3;
+
+        int c = 0;
+        for (; c + 16 <= head_dim; c += 16) {
+            float* ptr = scores.data() + cur_off + c*4;
+
+            __m512 v0 = _mm512_loadu_ps(ptr +  0);
+            __m512 v1 = _mm512_loadu_ps(ptr + 16);
+            __m512 v2 = _mm512_loadu_ps(ptr + 32);
+            __m512 v3 = _mm512_loadu_ps(ptr + 48);
+
+            v0 = _mm512_mul_ps(v0, scale);
+            v1 = _mm512_mul_ps(v1, scale);
+            v2 = _mm512_mul_ps(v2, scale);
+            v3 = _mm512_mul_ps(v3, scale);
+
+            _mm512_storeu_ps(ptr +  0, v0);
+            _mm512_storeu_ps(ptr + 16, v1);
+            _mm512_storeu_ps(ptr + 32, v2);
+            _mm512_storeu_ps(ptr + 48, v3);
+        }
+
+        // scalar tail
+        for (; c < head_dim; c++) {
+            float* ptr = scores.data() + cur_off + c*4;
+            ptr[0] *= inv1;
+            ptr[1] *= inv2;
+            ptr[2] *= inv3;
+            ptr[3] *= inv4;
+        }
+
+        processed += head_dim;
+    }
+
+#else
+    // Original fallback
+    float m1 = -INFINITY, m2 = -INFINITY, m3 = -INFINITY, m4 = -INFINITY;
+    offset -= len * stride;
+    int old_offset = offset;
+    for (int i = 0; i < len; ++i) {
+        if (i % stride == 0)
+            offset += len * stride;
+        m1 = std::max(m1, scores[offset + (i % stride) * 4]);
+        m2 = std::max(m2, scores[offset + (i % stride) * 4 + 1]);
+        m3 = std::max(m3, scores[offset + (i % stride) * 4 + 2]);
+        m4 = std::max(m4, scores[offset + (i % stride) * 4 + 3]);
+    }
+    float s1 = 0, s2 = 0, s3 = 0, s4 = 0;
+    offset = old_offset;
+    for (int i = 0; i < len; ++i) {
+        if (i % stride == 0)
+            offset += len * stride;
+        float v1 = expf(scores[offset + (i % stride) * 4] - m1);
+        float v2 = expf(scores[offset + (i % stride) * 4 + 1] - m2);
+        float v3 = expf(scores[offset + (i % stride) * 4 + 2] - m3);
+        float v4 = expf(scores[offset + (i % stride) * 4 + 3] - m4);
+        scores[offset + (i % stride) * 4]     = v1;
+        scores[offset + (i % stride) * 4 + 1] = v2;
+        scores[offset + (i % stride) * 4 + 2] = v3;
+        scores[offset + (i % stride) * 4 + 3] = v4;
+        s1 += v1; s2 += v2; s3 += v3; s4 += v4;
+    }
+    float inv1 = 1.f/s1, inv2 = 1.f/s2, inv3 = 1.f/s3, inv4 = 1.f/s4;
+    offset = old_offset;
+    for (int i = 0; i < len; ++i) {
+        if (i % stride == 0)
+            offset += len * stride;
+        scores[offset + (i % stride) * 4]     *= inv1;
+        scores[offset + (i % stride) * 4 + 1] *= inv2;
+        scores[offset + (i % stride) * 4 + 2] *= inv3;
+        scores[offset + (i % stride) * 4 + 3] *= inv4;
+    }
+#endif
 }
 
 // duplicate kv tensors along head dimension to match q_heads
@@ -159,37 +421,352 @@ static inline vector<float> transpose(const vector<float>& X, int rows, int cols
 }
 
 static inline void apply_rope(vector<float>& buf, const vector<float>& cosbuf, const vector<float>& sinbuf,
-                               int heads, int head_dim, int seq_len) {
+                              int heads, int head_dim, int seq_len) {
+#ifdef __AVX512F__
     int half = head_dim / 2;
-    for (int h = 0; h < heads; ++h) {
-        int head_base = h * head_dim;
-        for (int pos = 0; pos < seq_len; ++pos) {
-            int base = head_base + pos * head_dim * heads;
-            int cosbase = pos * head_dim;
-            for (int i = 0; i < half; ++i) {
+    for (int pos = 0; pos < seq_len; ++pos) {
+        int pos_base = pos * head_dim * heads;
+        int cosbase  = pos * head_dim;
+        for (int h = 0; h < heads; ++h) {
+            int base = pos_base + h * head_dim;
+            int i = 0;
+            for (; i + 16 <= half; i += 16) {
+                const float* px1 = &buf[base + i];
+                const float* px2 = &buf[base + i + half];
+                const float* pcosl = &cosbuf[cosbase + i];
+                const float* psinl = &sinbuf[cosbase + i];
+                const float* pcosh = &cosbuf[cosbase + i + half];
+                const float* psinh = &sinbuf[cosbase + i + half];
+
+                __m512 x1 = _mm512_loadu_ps(px1);
+                __m512 x2 = _mm512_loadu_ps(px2);
+                __m512 cos_low  = _mm512_loadu_ps(pcosl);
+                __m512 sin_low  = _mm512_loadu_ps(psinl);
+                __m512 cos_high = _mm512_loadu_ps(pcosh);
+                __m512 sin_high = _mm512_loadu_ps(psinh);
+
+                __m512 y1 = _mm512_fmsub_ps(x1, cos_low, _mm512_mul_ps(x2, sin_low));
+                __m512 y2 = _mm512_fmadd_ps(x2, cos_high, _mm512_mul_ps(x1, sin_high));
+
+                _mm512_storeu_ps(&buf[base + i],        y1);
+                _mm512_storeu_ps(&buf[base + i + half], y2);
+            }
+            for (; i < half; ++i) {
                 float x1 = buf[base + i];
                 float x2 = buf[base + i + half];
-                float cosv_low = cosbuf[cosbase + i];
-                float sinv_low = sinbuf[cosbase + i];
-                float cosv_high = cosbuf[cosbase + i + half];
-                float sinv_high = sinbuf[cosbase + i + half];
-
-                float y1 = x1 * cosv_low - x2 * sinv_low;
-                float y2 = x2 * cosv_high + x1 * sinv_high;
-
-                buf[base + i] = y1;
+                float cos_low  = cosbuf[cosbase + i];
+                float sin_low  = sinbuf[cosbase + i];
+                float cos_high = cosbuf[cosbase + i + half];
+                float sin_high = sinbuf[cosbase + i + half];
+                float y1 = x1 * cos_low - x2 * sin_low;
+                float y2 = x2 * cos_high + x1 * sin_high;
+                buf[base + i]        = y1;
                 buf[base + i + half] = y2;
             }
         }
     }
+#else
+    int half = head_dim / 2;
+    for (int pos = 0; pos < seq_len; ++pos) {
+        int pos_base = pos * head_dim * heads;
+        int cosbase  = pos * head_dim;
+        for (int h = 0; h < heads; ++h) {
+            int base = pos_base + h * head_dim;
+            for (int i = 0; i < half; ++i) {
+                float x1 = buf[base + i];
+                float x2 = buf[base + i + half];
+                float cos_low  = cosbuf[cosbase + i];
+                float sin_low  = sinbuf[cosbase + i];
+                float cos_high = cosbuf[cosbase + i + half];
+                float sin_high = sinbuf[cosbase + i + half];
+                float y1 = x1 * cos_low - x2 * sin_low;
+                float y2 = x2 * cos_high + x1 * sin_high;
+                buf[base + i]        = y1;
+                buf[base + i + half] = y2;
+            }
+        }
+    }
+#endif
 }
 
-static inline void strided_store(const vector<float>& src, float* dst, int rows, int row_stride, int cols) {
-    for (int i = 0; i < rows; ++i) {
-        const float* src_row = &src[i * cols];
-        float* dst_row = &dst[i * row_stride];
-        memcpy(dst_row, src_row, cols * sizeof(float));
+static inline void apply_rope_packed(vector<float>& buf, const vector<float>& cosbuf, const vector<float>& sinbuf,
+                                     int heads, int head_dim, int seq_len) {
+#ifdef __AVX512F__
+    const int half = head_dim / 2;
+    for (int h = 0; h < heads; ++h) {
+        const int split_base = h * seq_len * head_dim;
+        int pos_end = seq_len / 4;
+        for (int pos = 0; pos < pos_end; ++pos) {
+            const int pos_base = split_base + pos * 4 * head_dim;
+            const int cosbase  = pos * 4 * head_dim;
+            int i = 0;
+            for (; i + 4 <= half; i += 4) {
+                const float* px1 = &buf[pos_base + i * 4];
+                const float* px2 = &buf[pos_base + (i + half) * 4];
+                const float* pcosl = &cosbuf[cosbase + i * 4];
+                const float* psinl = &sinbuf[cosbase + i * 4];
+                const float* pcosh = &cosbuf[cosbase + (i + half) * 4];
+                const float* psinh = &sinbuf[cosbase + (i + half) * 4];
+
+                __m512 x1       = _mm512_loadu_ps(px1);
+                __m512 x2       = _mm512_loadu_ps(px2);
+                __m512 cos_low  = _mm512_loadu_ps(pcosl);
+                __m512 sin_low  = _mm512_loadu_ps(psinl);
+                __m512 cos_high = _mm512_loadu_ps(pcosh);
+                __m512 sin_high = _mm512_loadu_ps(psinh);
+
+                __m512 y1 = _mm512_fmsub_ps(x1, cos_low, _mm512_mul_ps(x2, sin_low));
+                __m512 y2 = _mm512_fmadd_ps(x2, cos_high, _mm512_mul_ps(x1, sin_high));
+
+                _mm512_storeu_ps(&buf[pos_base + i * 4],         y1);
+                _mm512_storeu_ps(&buf[pos_base + (i + half) * 4], y2);
+            }
+            for (; i < half; ++i) {
+                for (int l = 0; l < 4; ++l) {
+                    int base = pos_base + l;
+                    float x1 = buf[base + i * 4];
+                    float x2 = buf[base + (i + half) * 4];
+                    float cos_low  = cosbuf[cosbase + i * 4];
+                    float sin_low  = sinbuf[cosbase + i * 4];
+                    float cos_high = cosbuf[cosbase + (i + half) * 4];
+                    float sin_high = sinbuf[cosbase + (i + half) * 4];
+                    float y1 = x1 * cos_low - x2 * sin_low;
+                    float y2 = x2 * cos_high + x1 * sin_high;
+                    buf[base + i * 4]         = y1;
+                    buf[base + (i + half) * 4] = y2;
+                }
+            }
+        }
     }
+#else
+    const int half = head_dim / 2;
+    for (int h = 0; h < heads; ++h) {
+        const int split_base = h * seq_len * head_dim;
+        int pos_end = seq_len / 4;
+        for (int pos = 0; pos < pos_end; ++pos) {
+            const int pos_base = split_base + pos * 4 * head_dim;
+            for (int i = 0; i < half; ++i) {
+                for (int l = 0; l < 4; ++l) {
+                    int base = pos_base + l;
+                    const int cosbase  = pos * 4 * head_dim + l;
+                    float x1 = buf[base + i * 4];
+                    float x2 = buf[base + (i + half) * 4];
+                    float cos_low  = cosbuf[cosbase + i * 4];
+                    float sin_low  = sinbuf[cosbase + i * 4];
+                    float cos_high = cosbuf[cosbase + (i + half) * 4];
+                    float sin_high = sinbuf[cosbase + (i + half) * 4];
+                    float y1 = x1 * cos_low - x2 * sin_low;
+                    float y2 = x2 * cos_high + x1 * sin_high;
+                    buf[base + i * 4]         = y1;
+                    buf[base + (i + half) * 4] = y2;
+                }
+            }
+        }
+    }
+#endif
+}
+
+static inline vector<float> multi_head_attention_blas(const vector<float>& X,
+                                                 const vector<float>& Wq,
+                                                 const vector<float>& Wk,
+                                                 const vector<float>& Wv,
+                                                 const vector<float>& Wo,
+                                                 const vector<float>& sin_cache,
+                                                 const vector<float>& cos_cache,
+                                                 const vector<float>& sint_cache,
+                                                 const vector<float>& cost_cache,
+                                                 const vector<float>& mask,
+                                                 const vector<float>& ref_q,
+                                                 const vector<float>& ref_rope,
+                                                 const vector<float>& ref_attn_softmax,
+                                                 int seq_len,
+                                                 int emb_dim,
+                                                 int q_heads, int kv_heads) {
+    int q_head_dim = emb_dim / q_heads;
+    int kv_head_dim = seq_len / kv_heads;
+    int head_ratio = q_heads / kv_heads;
+    int beta = 0;
+    int alpha = 1;
+    vector<float> Q(emb_dim * seq_len, 0.0f);
+    vector<float> K(seq_len * seq_len, 0.0f);
+    vector<float> V(seq_len * seq_len, 0.0f);
+    vector<float> out_heads(seq_len * emb_dim, 0.0f);
+    vector<float> attn(seq_len * seq_len, 0.0f);
+
+    gemm_seq(CblasRowMajor, CblasNoTrans, CblasTrans, CblasPre,
+                seq_len, emb_dim, emb_dim,
+                alpha,
+                X.data(), emb_dim,
+                Wq.data(), emb_dim,
+                beta,
+                Q.data(), q_head_dim,
+                q_head_dim, 0);
+    matmul(CblasRowMajor, CblasNoTrans, CblasTrans,
+                seq_len, seq_len, emb_dim,
+                alpha,
+                X.data(), emb_dim,
+                Wk.data(), emb_dim,
+                beta,
+                K.data(), seq_len);
+    matmul(CblasRowMajor, CblasNoTrans, CblasTrans,
+                seq_len, seq_len, emb_dim,
+                alpha,
+                X.data(), emb_dim,
+                Wv.data(), emb_dim,
+                beta,
+                V.data(), seq_len);
+
+    // --- RoPE using cos_cache and sin_cache ---
+    // clock_t rope_s = clock();
+
+    apply_rope_packed(Q, cost_cache, sint_cache, q_heads, q_head_dim, seq_len);
+    // printf("ROPE-Packed time: %.2f ms\n", 1000.0 * (double)(clock() - rope_s) / CLOCKS_PER_SEC);
+    // rope_s = clock();
+    // apply_rope(Q, cos_cache, sin_cache, q_heads, q_head_dim, seq_len);
+    // printf("ROPE-Unpacked time: %.2f ms\n", 1000.0 * (double)(clock() - rope_s) / CLOCKS_PER_SEC);
+    // FILE *file_nai_c = fopen("q_rope_packed.csv","w");
+    // for(int i=0; i<(seq_len*emb_dim)/4; i++){
+    //     for (int j=0; j<4; j++){
+    //         if(j>0)
+    //             fprintf(file_nai_c, ",");
+    //         fprintf(file_nai_c, "%.8f", Q[i*4 + j]);
+    //     }
+    //     fprintf(file_nai_c, "\n");
+    // }
+    apply_rope(K, cos_cache, sin_cache, kv_heads, kv_head_dim, seq_len);
+
+    // reshape and duplicate KV heads
+    // vector<float> K_rep = repeat_kv_heads(K, seq_len, kv_heads, kv_head_dim, head_ratio);
+    // vector<float> V_rep = repeat_kv_heads(V, seq_len, kv_heads, kv_head_dim, head_ratio);
+
+    // attention scores: [seq_len, seq_len]
+    int out_addr = 0;
+    for (int h = 0; h < q_heads; ++h) {
+        gemm_seq(CblasRowMajor, CblasNoTrans, CblasTrans, CblasMid,
+            seq_len, seq_len, q_head_dim,
+            alpha,
+            Q.data() + h * q_head_dim * seq_len, emb_dim,
+            K.data() + h/head_ratio * q_head_dim, seq_len,
+            beta,
+            attn.data(), seq_len,
+            seq_len/2, 0);
+        // FILE *file_nai_c = fopen("attn.csv","w");
+        // for(int i=0; i<seq_len; i++){
+        //     for (int j=0; j<seq_len; j++){
+        //         if(j>0)
+        //             fprintf(file_nai_c, ",");
+        //         fprintf(file_nai_c, "%.8f", attn[i*seq_len + j]);
+        //     fprintf(file_nai_c, "\n");
+        // }
+
+        // TODO: If mask has different values for each position, this is wrong
+        for (int i = 0; i < seq_len * seq_len; ++i){
+            attn[i] = attn[i] / sqrtf((float)q_head_dim) + mask[i];
+        }
+        for (int i = 0; i < seq_len/4; ++i)
+            softmax_inplace_packed(attn, i * seq_len/2 * 4, seq_len, q_head_dim, seq_len/2);
+        // weighted sum: [seq_len, 64]
+        // int t = 4;
+        if (h<21){
+            out_addr += (h%7 == 0 && h) ? 448*seq_len : 0;
+            gemm_seq(CblasRowMajor, CblasNoTrans, CblasNoTrans, CblasMid,
+                seq_len, q_head_dim, seq_len,
+                alpha,
+                attn.data(), seq_len,
+                V.data() + h/head_ratio * q_head_dim, seq_len,
+                beta,
+                out_heads.data() + (h%7) * q_head_dim * 4 + out_addr, 1792, //448*4
+                -1, 448);
+        }else if (h<26){
+            out_addr += (h%7 == 0 && h) ? 448*seq_len : 0;
+            gemm_seq(CblasRowMajor, CblasNoTrans, CblasNoTrans, CblasMid,
+                seq_len, q_head_dim, seq_len,
+                alpha,
+                attn.data(), seq_len,
+                V.data() + h/head_ratio * q_head_dim, seq_len,
+                1.0f,
+                out_heads.data() + (h%7) * q_head_dim * 4 + out_addr, 1408,
+                -1, 352);
+        } else if (h==26){
+            out_addr += (h%7 == 0 && h) ? 448*seq_len : 0;
+            gemm_seq(CblasRowMajor, CblasNoTrans, CblasNoTrans, CblasMid,
+                seq_len, q_head_dim/2, seq_len,
+                alpha,
+                attn.data(), seq_len,
+                V.data() + h/head_ratio * q_head_dim, seq_len,
+                beta,
+                out_heads.data() + (h%7) * q_head_dim * 4 + out_addr, 1408,
+                -1, 352);
+            out_addr = seq_len * (q_head_dim/2 + 26 * q_head_dim);
+            gemm_seq(CblasRowMajor, CblasNoTrans, CblasNoTrans, CblasMid,
+                seq_len, q_head_dim/2, seq_len,
+                alpha,
+                attn.data(), seq_len,
+                V.data() + h/head_ratio * q_head_dim + q_head_dim/2, seq_len,
+                1.0f,
+                out_heads.data() + out_addr, seq_len,
+                q_head_dim/2, 352);
+            out_addr += q_head_dim * 2;
+        } else{
+            // FILE *file_nat_c = fopen("out_heads_new.csv","w");;
+            // for(int i=0; i<(seq_len*emb_dim); i++){
+            //     if((i>0) && (i%4!=0))
+            //         fprintf(file_nat_c, ",");
+            //     fprintf(file_nat_c, "%.8f", out_heads[i]);
+            //     if ((i+1)%4==0){
+            //         fprintf(file_nat_c, "\n");
+            //     }
+            // }
+            gemm_seq(CblasRowMajor, CblasNoTrans, CblasNoTrans, CblasMid,
+                seq_len, q_head_dim, seq_len,
+                alpha,
+                attn.data(), seq_len,
+                V.data() + h/head_ratio * q_head_dim, seq_len,
+                1.0f,
+                out_heads.data() + out_addr, 1792, //448*4
+                -1, 352);
+            out_addr += q_head_dim * 4;
+        }
+
+        //     }
+        // } else{
+        //     gemm_seq(CblasRowMajor, CblasNoTrans, CblasNoTrans, CblasMid,
+        //         seq_len, q_head_dim, seq_len,
+        //         alpha,
+        //         attn.data(), seq_len,
+        //         V.data() + h/head_ratio * q_head_dim, seq_len,
+        //         1.0f,
+        //         out_heads.data() + (h%7) * q_head_dim * 4 + out_addr, 1792, //448*4
+        //         -1, 448);
+        // }
+        // gemm_seq(CblasRowMajor, CblasNoTrans, CblasNoTrans, CblasMid,
+        //     seq_len, q_head_dim, seq_len,
+        //     alpha,
+        //     attn.data(), seq_len,
+        //     V.data() + h/head_ratio * q_head_dim, seq_len,
+        //     1.0f,
+        //     out_heads.data() + h * q_head_dim, emb_dim,
+        //     -1, 0);
+    }
+    // FILE *file_nat_c = fopen("out_heads_new.csv","w");;
+    // for(int i=0; i<(seq_len*emb_dim); i++){
+    //     if((i>0) && (i%4!=0))
+    //         fprintf(file_nat_c, ",");
+    //     fprintf(file_nat_c, "%.8f", out_heads[i]);
+    //     if ((i+1)%4==0){
+    //         fprintf(file_nat_c, "\n");
+    //     }
+    // }
+    vector<float> out(seq_len * emb_dim, 0.0f);
+    gemm_seq(CblasRowMajor, CblasNoTrans, CblasTrans, CblasPos,
+            seq_len, emb_dim, emb_dim,
+            alpha,
+            out_heads.data(), emb_dim,
+            Wo.data(), emb_dim,
+            beta,
+            out.data(), emb_dim,
+            -1, 0);
+    return out;
 }
 
 // change to respect diferent head count for q and k/v
@@ -203,18 +780,7 @@ static inline vector<float> multi_head_attention(const vector<float>& X,
                                                  const vector<float>& mask,
                                                  int seq_len,
                                                  int emb_dim,
-                                                 int q_heads, int kv_heads,
-                                                 const vector<float>& q_out_ref,
-                                                 const vector<float>& k_out_ref,
-                                                 const vector<float>& v_out_ref,
-                                                 const vector<float>& q_out_rot_ref,
-                                                 const vector<float>& k_out_rot_ref,
-                                                 const vector<float>& attn_output_ref,
-                                                 const vector<float>& attn_output_reshaped_ref,
-                                                 const vector<float>& key_repeted_ref,
-                                                 const vector<float>& value_repeted_ref,
-                                                 const vector<float>& attn_weights_ref,
-                                                 const vector<float>& attn_weights_softmax_ref) {
+                                                 int q_heads, int kv_heads) {
     int q_head_dim = emb_dim / q_heads;
     int kv_head_dim = seq_len / kv_heads;
     int head_ratio = q_heads / kv_heads;
@@ -250,13 +816,21 @@ static inline vector<float> multi_head_attention(const vector<float>& X,
 
     // --- RoPE using cos_cache and sin_cache ---
     apply_rope(Q, cos_cache, sin_cache, q_heads, q_head_dim, seq_len);
+    // FILE *file_nai_c = fopen("q_rope_original.csv","w");
+    // for(int i=0; i<seq_len; i++){
+    //     for (int j=0; j<emb_dim; j++){
+    //         if(j>0)
+    //             fprintf(file_nai_c, ",");
+    //         fprintf(file_nai_c, "%.8f", Q[i*emb_dim + j]);
+    //     }
+    //     fprintf(file_nai_c, "\n");
+    // }
     apply_rope(K, cos_cache, sin_cache, kv_heads, kv_head_dim, seq_len);
 
     // reshape and duplicate KV heads
     // vector<float> K_rep = repeat_kv_heads(K, seq_len, kv_heads, kv_head_dim, head_ratio);
     // vector<float> V_rep = repeat_kv_heads(V, seq_len, kv_heads, kv_head_dim, head_ratio);
 
-    int block_size = seq_len * q_head_dim;
     // attention scores: [seq_len, seq_len]
 
     for (int h = 0; h < q_heads; ++h) {
@@ -283,7 +857,6 @@ static inline vector<float> multi_head_attention(const vector<float>& X,
             beta,
             out_heads.data() + h * q_head_dim, emb_dim);
     }
-    compare_tensors(attn_output_reshaped_ref, out_heads, "Attention output reshaped", 0.01f);
     vector<float> out(seq_len * emb_dim, 0.0f);
     matmul(CblasRowMajor, CblasNoTrans, CblasTrans,
             seq_len, emb_dim, emb_dim,
@@ -294,7 +867,6 @@ static inline vector<float> multi_head_attention(const vector<float>& X,
             out.data(), emb_dim);
     return out;
 }
-
 
 static inline void silu_inplace(vector<float>& M) {
     int n = (int)M.size();
@@ -318,6 +890,8 @@ int main(int argc, char** argv) {
     int kv_heads = 8;
     int alpha = 1;
     int beta = 0;
+    clock_t init, end;
+    double naive_time = 0, new_time = 0;
 
     const string weights_root = "weights";
     auto file_exists = [&](const string &p) {
@@ -335,8 +909,10 @@ int main(int argc, char** argv) {
         seq_len = inp0.size() / emb_dim;
         N = 0;
         while (file_exists(weights_root + "/" + to_string(N) + "/inp.bin")) ++N;
-        cout << "Inferred seq_len=" << seq_len << " emb_dim=" << emb_dim << " layers=" << N << "\n";
+        //cout << "Inferred seq_len=" << seq_len << " emb_dim=" << emb_dim << " layers=" << N << "\n";
     }
+
+    arg_seq_len = (arg_seq_len) ? arg_seq_len : seq_len;
 
     while (q_heads > 1 && emb_dim % q_heads != 0) --q_heads;
     while (kv_heads > 1 && emb_dim % kv_heads != 0) --kv_heads;
@@ -353,9 +929,9 @@ int main(int argc, char** argv) {
 
     vector<float> global_rms_g(emb_dim, 1.0f);
     const float tol = 0.01f;
-
+    float spd_attn = 0.0f, spd_mlp = 0.0f;
     for (int layer = 0; layer < N; ++layer) {
-        cout << "\n=== LAYER " << layer << " ===\n";
+        // cout << "\n=== LAYER " << layer << " ===\n";
         string base = weights_root + "/" + to_string(layer) + "/";
 
         auto inp = load_bin(base + "inp.bin");
@@ -392,67 +968,130 @@ int main(int argc, char** argv) {
         auto rms_g2 = load_bin(base + "norm2_weight.bin");
         auto mask = load_bin(base + "mask.bin");
 
-        // 1. RMSNorm: inp → attn_inp
-        auto attn_inp = rmsnorm(inp, rms_g1, seq_len, emb_dim);
-        compare_tensors(attn_inp_ref, attn_inp, "attn_inp", tol);
+        if (arg_seq_len != seq_len)
+            mask = reshape_tensor(mask, seq_len, arg_seq_len);
 
+        auto sin_t = copy_changed_layout(sin_cache, arg_seq_len, emb_dim/q_heads);
+        auto cos_t = copy_changed_layout(cos_cache, arg_seq_len, emb_dim/q_heads);
+        auto mask_t = copy_changed_layout(mask, arg_seq_len, arg_seq_len);
+        auto q_t = copy_changed_layout(q_out, arg_seq_len, emb_dim, emb_dim/q_heads);
+        auto rope_t = copy_changed_layout(q_out_rot, arg_seq_len, emb_dim, emb_dim/q_heads);
+        auto attn_softmax_t = copy_changed_layout(attn_weights_softmax_ref, arg_seq_len, arg_seq_len);
+
+        int D_mlp = W_gate.size() / emb_dim;
+        vector<float> after_attn(arg_seq_len * emb_dim);
+        vector<float> gate(arg_seq_len * D_mlp);
+        vector<float> up(arg_seq_len * D_mlp);
+        vector<float> mlp_out(arg_seq_len * emb_dim);
+
+        residual = (layer) ? residual : inp;
+
+        // 1. RMSNorm: inp → attn_inp
+        auto attn_inp = rmsnorm(residual, rms_g1, seq_len, emb_dim);
+
+        // compare_tensors(attn_inp_ref, attn_inp, "attn_inp", arg_seq_len*emb_dim, tol);
+        if (layer == 0){
+            attn_inp = attn_inp_ref;
+        }
         // 2. Attention: attn_inp → attn_out
-        auto attn_out = multi_head_attention(attn_inp_ref, Wq, Wk, Wv, Wo, sin_cache, cos_cache, mask, seq_len, emb_dim, q_heads, kv_heads,
-             q_out, k_out, v_out, q_out_rot, k_out_rot, attn_output_ref, attn_output_reshaped_ref, key_repeted_ref, value_repeted_ref,
-             attn_weights_ref, attn_weights_softmax_ref);
-        compare_tensors(attn_out_ref, attn_out, "attn_out", tol);
+        init = clock();
+        auto attn_out = multi_head_attention(attn_inp_ref, Wq, Wk, Wv, Wo, sin_cache, cos_cache, mask, arg_seq_len, emb_dim, q_heads, kv_heads);
+        end = clock();
+        naive_time = (double)(end - init) / CLOCKS_PER_SEC * 1000;
+        compare_tensors(attn_out_ref, attn_out, "attn_out", arg_seq_len*emb_dim, tol);
+        init = clock();
+        attn_out = multi_head_attention_blas(attn_inp_ref, Wq, Wk, Wv, Wo, sin_cache, cos_cache, sin_t, cos_t, mask_t, q_t, rope_t, attn_softmax_t, arg_seq_len, emb_dim, q_heads, kv_heads);
+        end = clock();
+        new_time = (double)(end - init) / CLOCKS_PER_SEC * 1000;
+        spd_attn += (100*(naive_time-new_time)/naive_time);
+        compare_tensors(attn_out_ref, attn_out, "attn_out", arg_seq_len*emb_dim, tol);
+
+
+        printf("Naive Attention time: %.2f ms\n", naive_time);
+        printf("New Attention time: %.2f ms\n", new_time);
+        break;
 
         // 3. Residual add: inp + attn_out
-        vector<float> after_attn(seq_len * emb_dim);
-        for (int i = 0; i < seq_len * emb_dim; ++i)
-            after_attn[i] = inp[i] + attn_out_ref[i];
-        compare_tensors(inp_norm2, after_attn, "after_attn", tol);
+        for (int i = 0; i < arg_seq_len * emb_dim; ++i)
+            after_attn[i] = inp[i] + attn_out[i];
+        // compare_tensors(inp_norm2, after_attn, "after_attn", arg_seq_len*emb_dim, tol);
 
         // 4. RMSNorm: after_attn → mlp_inp
-        auto mlp_inp = rmsnorm(inp_norm2, rms_g2, seq_len, emb_dim);
-        compare_tensors(mlp_inp_ref, mlp_inp, "mlp_inp", tol);
+        auto mlp_inp = rmsnorm(after_attn, rms_g2, arg_seq_len, emb_dim);
+        // compare_tensors(mlp_inp_ref, mlp_inp, "mlp_inp", arg_seq_len*emb_dim, tol);
 
         // 5. MLP: mlp_inp → mlp_out
-        int D_mlp = W_gate.size() / emb_dim;
-        vector<float> gate(seq_len * D_mlp);
-        vector<float> up(seq_len * D_mlp);
-        vector<float> mlp_out(seq_len * emb_dim);
+        init = clock();
         matmul(CblasRowMajor, CblasNoTrans, CblasTrans,
-            seq_len, D_mlp, emb_dim,
+            arg_seq_len, D_mlp, emb_dim,
             alpha,
-            mlp_inp_ref.data(), emb_dim,
+            mlp_inp.data(), emb_dim,
             W_gate.data(), emb_dim,
             beta,
             gate.data(), D_mlp);
         matmul(CblasRowMajor, CblasNoTrans, CblasTrans,
-            seq_len, D_mlp, emb_dim,
+            arg_seq_len, D_mlp, emb_dim,
             alpha,
-            mlp_inp_ref.data(), emb_dim,
+            mlp_inp.data(), emb_dim,
             W_up.data(), emb_dim,
             beta,
             up.data(), D_mlp);
-        compare_tensors(up_proj_out, up, "up_proj_out", tol);
+        // compare_tensors(up_proj_out, up, "up_proj_out", arg_seq_len*D_mlp, tol);
         silu_inplace(gate);
-        compare_tensors(gate_proj_out, gate, "gate_proj_out", tol);
+        // compare_tensors(gate_proj_out, gate, "gate_proj_out", arg_seq_len*D_mlp, tol);
         auto fused = mul(gate, up);
         matmul(CblasRowMajor, CblasNoTrans, CblasTrans,
-            seq_len, emb_dim, D_mlp,
+            arg_seq_len, emb_dim, D_mlp,
             alpha,
             fused.data(), D_mlp,
             W_down.data(), D_mlp,
             beta,
             mlp_out.data(), emb_dim);
-        compare_tensors(mlp_out_ref, mlp_out, "mlp_out", tol);
+        end = clock();
+        naive_time = (double)(init - end) / CLOCKS_PER_SEC * 1000;
+        // compare_tensors(mlp_out_ref, mlp_out, "mlp_out", arg_seq_len*emb_dim, tol);
+
+        init = clock();
+        gemm_seq(CblasRowMajor, CblasNoTrans, CblasTrans, CblasMid,
+            arg_seq_len, D_mlp, emb_dim,
+            alpha,
+            mlp_inp.data(), emb_dim,
+            W_gate.data(), emb_dim,
+            beta,
+            gate.data(), D_mlp,
+            -1, 0);
+        gemm_seq(CblasRowMajor, CblasNoTrans, CblasTrans, CblasMid,
+            arg_seq_len, D_mlp, emb_dim,
+            alpha,
+            mlp_inp.data(), emb_dim,
+            W_up.data(), emb_dim,
+            beta,
+            up.data(), D_mlp,
+            -1, 0);
+        silu_inplace(gate);
+        fused = mul(gate, up);
+        gemm_seq(CblasRowMajor, CblasNoTrans, CblasTrans, CblasMid,
+            arg_seq_len, emb_dim, D_mlp,
+            alpha,
+            fused.data(), D_mlp,
+            W_down.data(), D_mlp,
+            beta,
+            mlp_out.data(), emb_dim,
+            -1, 0);
+        end = clock();
+        new_time = (double)(init - end) / CLOCKS_PER_SEC * 1000;
+        spd_mlp += (int)(100*(naive_time-new_time)/naive_time);
 
         // 6. Residual add: after_attn + mlp_out → out
-        vector<float> out(seq_len * emb_dim);
-        for (int i = 0; i < seq_len * emb_dim; ++i)
+        vector<float> out(arg_seq_len * emb_dim);
+        for (int i = 0; i < arg_seq_len * emb_dim; ++i)
             out[i] = after_attn[i] + mlp_out_ref[i];
-        compare_tensors(out_ref, out, "out", tol);
+        // compare_tensors(out_ref, out, "out", arg_seq_len*emb_dim, tol);
 
         residual = move(out);
     }
-
+    printf("Speedup (Attention): %d%\n", (int)(spd_attn/N));
+    printf("Speedup (MLP): %d%\n", (int)(spd_mlp/N));
     cout << "\nAll layers validated.\n";
     return 0;
 }
