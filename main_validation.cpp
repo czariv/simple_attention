@@ -124,17 +124,254 @@ static inline vector<float> mul(const vector<float>& A, const vector<float>& B) 
 
 static inline vector<float> rmsnorm(const vector<float>& X, const vector<float>& g, int seq_len, int emb_dim, float eps=1e-5f) {
     vector<float> Y(seq_len * emb_dim);
+
+#if defined(__AVX512F__)
+    const int VEC = 16;
+    const __m512 eps_v = _mm512_set1_ps(eps);
+    const __m512 emb_dim_v = _mm512_set1_ps((float)emb_dim);
+
     for (int i = 0; i < seq_len; ++i) {
+
         const float* row = &X[i * emb_dim];
-        float sumsq = 0.0f;
-        for (int d = 0; d < emb_dim; ++d) {
-            float v = row[d];
-            sumsq += v * v;
+        float* out_row   = &Y[i * emb_dim];
+
+        __m512 acc = _mm512_setzero_ps();
+        int d = 0;
+
+        for (; d + VEC <= emb_dim; d += VEC) {
+            __m512 v = _mm512_loadu_ps(row + d);
+            acc = _mm512_fmadd_ps(v, v, acc);
         }
+
+        float sumsq = _mm512_reduce_add_ps(acc);
+        for (; d < emb_dim; ++d) sumsq += row[d] * row[d];
+
+        float rms    = sqrtf(sumsq / emb_dim + eps);
+        float scale  = 1.0f / rms;
+        __m512 scale_v = _mm512_set1_ps(scale);
+
+        d = 0;
+        for (; d + VEC <= emb_dim; d += VEC) {
+            __m512 v  = _mm512_loadu_ps(row + d);
+            __m512 gv = _mm512_loadu_ps(&g[d]);
+            __m512 y  = _mm512_mul_ps(_mm512_mul_ps(v, scale_v), gv);
+            _mm512_storeu_ps(out_row + d, y);
+        }
+
+        for (; d < emb_dim; ++d) {
+            out_row[d] = row[d] * scale * g[d];
+        }
+    }
+
+#else
+    for (int i = 0; i < seq_len; ++i) {
+
+        const float* row = &X[i * emb_dim];
+        float* out_row   = &Y[i * emb_dim];
+
+        float sumsq = 0.0f;
+        for (int d = 0; d < emb_dim; ++d) sumsq += row[d] * row[d];
+
         float rms = sqrtf(sumsq / emb_dim + eps);
         float scale = 1.0f / rms;
-        for (int d = 0; d < emb_dim; ++d) Y[i * emb_dim + d] = row[d] * scale * g[d];
+
+        for (int d = 0; d < emb_dim; ++d)
+            out_row[d] = row[d] * scale * g[d];
     }
+#endif
+
+    return Y;
+}
+
+static inline vector<float> rmsnorm_packed(const vector<float>& X, const vector<float>& g, int seq_len, int emb_dim, int block_size = 448, float eps=1e-5f) {
+    vector<float> Y(seq_len * emb_dim);
+#if defined(__AVX512F__)
+    const int B = 704;
+    const int block_size_B = 352;
+    const int block_size_A = block_size;
+    for (int i = 0; i < seq_len; i += 4)
+    {
+        const float* row  = &X[i * block_size_A];
+        float* out_row    = &Y[i * block_size_A];
+
+        __m512 vsumsq = _mm512_setzero_ps();
+
+        auto broadcast4 = [] (float x0, float x1, float x2, float x3) {
+            return _mm512_set_ps(
+                x3,x3,x3,x3, x2,x2,x2,x2,
+                x1,x1,x1,x1, x0,x0,x0,x0
+            );
+        };
+
+        // --------------------------
+        // REGION A ACCUMULATION
+        // --------------------------
+        int offset = 0;
+        int d = 0;
+
+        for (; d < emb_dim - B; d += 4)
+        {
+            if (d && (d % block_size_A) == 0)
+                offset += block_size_A * seq_len;
+
+            const float* base = row + offset + (d % block_size_A) * 4;
+
+            __m512 vx = _mm512_loadu_ps(base);
+
+            vsumsq = _mm512_fmadd_ps(vx, vx, vsumsq);
+        }
+
+        // --------------------------
+        // REGION B ACCUMULATION
+        // --------------------------
+
+        offset += (block_size_A * seq_len) - 96 * i;
+        int block_size = block_size_B;
+
+        for (int dd = 0; dd < B; dd += 4, d += 4)
+        {
+            if (dd && (dd % block_size) == 0)
+                offset += block_size * seq_len;
+
+            const float* base = row + offset + (dd % block_size) * 4;
+
+            __m512 vx = _mm512_loadu_ps(base);
+
+            vsumsq = _mm512_fmadd_ps(vx, vx, vsumsq);
+        }
+
+        // --------------------------
+        // SINGLE UNPACK
+        // --------------------------
+
+        __m256 lo256 = _mm512_castps512_ps256(vsumsq);
+        __m256 hi256 = _mm512_extractf32x8_ps(vsumsq, 1);
+        __m256 sum256 = _mm256_add_ps(lo256, hi256);
+
+        __m128 lo128 = _mm256_castps256_ps128(sum256);
+        __m128 hi128 = _mm256_extractf128_ps(sum256, 1);
+        __m128 sum128 = _mm_add_ps(lo128, hi128);
+
+        float inv1 = 1.0f / sqrtf(sum128[0] / emb_dim + eps);
+        float inv2 = 1.0f / sqrtf(sum128[1]/ emb_dim + eps);
+        float inv3 = 1.0f / sqrtf(sum128[2] / emb_dim + eps);
+        float inv4 = 1.0f / sqrtf(sum128[3] / emb_dim + eps);
+
+        __m512 v_inv = _mm512_set4_ps(inv4, inv3, inv2, inv1);
+        // --------------------------
+        // WRITEBACK REGION A
+        // --------------------------
+        offset = 0;
+        block_size = block_size_A;
+
+        for (int d = 0; d < emb_dim - B; d += 4)
+        {
+            if (d && (d % block_size) == 0)
+                offset += block_size * seq_len;
+
+            const float* base = row + offset + (d % block_size) * 4;
+            float* out  = out_row + offset + (d % block_size) * 4;
+
+            __m512 vx = _mm512_loadu_ps(base);
+
+            __m512 vg = broadcast4(g[d], g[d+1], g[d+2], g[d+3]);
+
+            __m512 scaled = _mm512_mul_ps(_mm512_mul_ps(vx, v_inv), vg);
+
+            _mm512_storeu_ps(out, scaled);
+        }
+
+        // --------------------------
+        // WRITEBACK REGION B
+        // --------------------------
+        offset += (block_size_A * seq_len) - 96 * i;
+        block_size = block_size_B;
+
+        for (int dd = 0; dd < B; dd += 4)
+        {
+            int gd = emb_dim - B + dd;
+
+            if (dd && (dd % block_size) == 0)
+                offset += block_size * seq_len;
+
+            const float* base = row + offset + (dd % block_size) * 4;
+                  float* out  = out_row + offset + (dd % block_size) * 4;
+
+            __m512 vx = _mm512_loadu_ps(base);
+
+            __m512 vg = broadcast4(g[gd], g[gd+1], g[gd+2], g[gd+3]);
+
+            __m512 scaled = _mm512_mul_ps(_mm512_mul_ps(vx, v_inv), vg);
+
+            _mm512_storeu_ps(out, scaled);
+        }
+    }
+#else
+    for (int i = 0; i < seq_len; i+=4) {
+        int offset = 0;
+        const float* row = &X[i * block_size];
+        float* out_row   = &Y[i * block_size];
+        float sumsq1 = 0.0f;
+        float sumsq2 = 0.0f;
+        float sumsq3 = 0.0f;
+        float sumsq4 = 0.0f;
+        for (int d = 0; d < (emb_dim - 704); ++d) {
+            if (d%block_size == 0 && d != 0)
+                offset += block_size*seq_len;
+            float v1 = row[offset + (d%block_size)*4];
+            float v2 = row[offset + (d%block_size)*4 + 1];
+            float v3 = row[offset + (d%block_size)*4 + 2];
+            float v4 = row[offset + (d%block_size)*4 + 3];
+            sumsq1 += v1 * v1;
+            sumsq2 += v2 * v2;
+            sumsq3 += v3 * v3;
+            sumsq4 += v4 * v4;
+        }
+        offset += block_size*seq_len - 96*(i);
+        block_size = 352;
+        for (int d = 0; d < 704; ++d) {
+            if (d%block_size == 0 && d != 0)
+                offset += block_size*seq_len;
+            float v1 = row[offset + (d%block_size)*4];
+            float v2 = row[offset + (d%block_size)*4 + 1];
+            float v3 = row[offset + (d%block_size)*4 + 2];
+            float v4 = row[offset + (d%block_size)*4 + 3];
+            sumsq1 += v1 * v1;
+            sumsq2 += v2 * v2;
+            sumsq3 += v3 * v3;
+            sumsq4 += v4 * v4;
+        }
+        float rms1 = sqrtf(sumsq1 / emb_dim + eps);
+        float rms2 = sqrtf(sumsq2 / emb_dim + eps);
+        float rms3 = sqrtf(sumsq3 / emb_dim + eps);
+        float rms4 = sqrtf(sumsq4 / emb_dim + eps);
+        float scale1 = 1.0f / rms1;
+        float scale2 = 1.0f / rms2;
+        float scale3 = 1.0f / rms3;
+        float scale4 = 1.0f / rms4;
+        offset = 0;
+        block_size = 448;
+        for (int d = 0; d < (emb_dim - 704); ++d) {
+            if (d%block_size == 0 && d != 0)
+                offset += block_size*seq_len;
+            out_row[offset + (d%block_size)*4]     = row[offset + (d%block_size)*4]     * scale1 * g[d];
+            out_row[offset + (d%block_size)*4 + 1] = row[offset + (d%block_size)*4 + 1] * scale2 * g[d];
+            out_row[offset + (d%block_size)*4 + 2] = row[offset + (d%block_size)*4 + 2] * scale3 * g[d];
+            out_row[offset + (d%block_size)*4 + 3] = row[offset + (d%block_size)*4 + 3] * scale4 * g[d];
+        }
+        offset += block_size*seq_len - 96*(i);
+        block_size = 352;
+        for (int d = 0; d < 704; ++d) {
+            if (d%block_size == 0 && d != 0)
+                offset += block_size*seq_len;
+            out_row[offset + (d%block_size)*4]     = row[offset + (d%block_size)*4]     * scale1 * g[emb_dim-704 + d];
+            out_row[offset + (d%block_size)*4 + 1] = row[offset + (d%block_size)*4 + 1] * scale2 * g[emb_dim-704 + d];
+            out_row[offset + (d%block_size)*4 + 2] = row[offset + (d%block_size)*4 + 2] * scale3 * g[emb_dim-704 + d];
+            out_row[offset + (d%block_size)*4 + 3] = row[offset + (d%block_size)*4 + 3] * scale4 * g[emb_dim-704 + d];
+        }
+        block_size = 448;
+    }
+#endif
     return Y;
 }
 
@@ -593,7 +830,7 @@ static inline vector<float> multi_head_attention_blas(const vector<float>& X,
     vector<float> out_heads(seq_len * emb_dim, 0.0f);
     vector<float> attn(seq_len * seq_len, 0.0f);
 
-    gemm_seq(CblasRowMajor, CblasNoTrans, CblasTrans, CblasPre,
+    gemm_seq(CblasRowMajor, CblasNoTrans, CblasTrans, CblasMid,
                 seq_len, emb_dim, emb_dim,
                 alpha,
                 X.data(), emb_dim,
@@ -601,20 +838,22 @@ static inline vector<float> multi_head_attention_blas(const vector<float>& X,
                 beta,
                 Q.data(), q_head_dim,
                 q_head_dim, 0);
-    matmul(CblasRowMajor, CblasNoTrans, CblasTrans,
+    gemm_seq(CblasRowMajor, CblasNoTrans, CblasTrans, CblasPos,
                 seq_len, seq_len, emb_dim,
                 alpha,
                 X.data(), emb_dim,
                 Wk.data(), emb_dim,
                 beta,
-                K.data(), seq_len);
-    matmul(CblasRowMajor, CblasNoTrans, CblasTrans,
+                K.data(), seq_len,
+                -1, 0);
+    gemm_seq(CblasRowMajor, CblasNoTrans, CblasTrans, CblasPos,
                 seq_len, seq_len, emb_dim,
                 alpha,
                 X.data(), emb_dim,
                 Wv.data(), emb_dim,
                 beta,
-                V.data(), seq_len);
+                V.data(), seq_len,
+                -1, 0);
 
     // --- RoPE using cos_cache and sin_cache ---
     // clock_t rope_s = clock();
@@ -758,7 +997,7 @@ static inline vector<float> multi_head_attention_blas(const vector<float>& X,
     //     }
     // }
     vector<float> out(seq_len * emb_dim, 0.0f);
-    gemm_seq(CblasRowMajor, CblasNoTrans, CblasTrans, CblasPos,
+    gemm_seq(CblasRowMajor, CblasNoTrans, CblasTrans, CblasMid,
             seq_len, emb_dim, emb_dim,
             alpha,
             out_heads.data(), emb_dim,
@@ -891,7 +1130,8 @@ int main(int argc, char** argv) {
     int alpha = 1;
     int beta = 0;
     clock_t init, end;
-    double naive_time = 0, new_time = 0;
+    double naive_time_attn = 0, naive_time_mlp = 0;
+    double new_time_attn = 0, new_time_mlp = 0;
 
     const string weights_root = "weights";
     auto file_exists = [&](const string &p) {
@@ -918,7 +1158,7 @@ int main(int argc, char** argv) {
     while (kv_heads > 1 && emb_dim % kv_heads != 0) --kv_heads;
 
     // Initialize or load input
-    vector<float> residual;
+    vector<float> residual, residual_rp;
     if (have_weights) residual = load_bin(weights_root + "/0/inp.bin");
     else {
         mt19937 rng(42);
@@ -931,7 +1171,7 @@ int main(int argc, char** argv) {
     const float tol = 0.01f;
     float spd_attn = 0.0f, spd_mlp = 0.0f;
     for (int layer = 0; layer < N; ++layer) {
-        // cout << "\n=== LAYER " << layer << " ===\n";
+        cout << "\n=== LAYER " << layer << " ===\n";
         string base = weights_root + "/" + to_string(layer) + "/";
 
         auto inp = load_bin(base + "inp.bin");
@@ -971,12 +1211,15 @@ int main(int argc, char** argv) {
         if (arg_seq_len != seq_len)
             mask = reshape_tensor(mask, seq_len, arg_seq_len);
 
-        auto sin_t = copy_changed_layout(sin_cache, arg_seq_len, emb_dim/q_heads);
-        auto cos_t = copy_changed_layout(cos_cache, arg_seq_len, emb_dim/q_heads);
-        auto mask_t = copy_changed_layout(mask, arg_seq_len, arg_seq_len);
-        auto q_t = copy_changed_layout(q_out, arg_seq_len, emb_dim, emb_dim/q_heads);
-        auto rope_t = copy_changed_layout(q_out_rot, arg_seq_len, emb_dim, emb_dim/q_heads);
-        auto attn_softmax_t = copy_changed_layout(attn_weights_softmax_ref, arg_seq_len, arg_seq_len);
+        auto sin_rp = copy_changed_layout(sin_cache, arg_seq_len, emb_dim/q_heads);
+        auto cos_rp = copy_changed_layout(cos_cache, arg_seq_len, emb_dim/q_heads);
+        auto mask_rp = copy_changed_layout(mask, arg_seq_len, arg_seq_len);
+        auto q_rp = copy_changed_layout(q_out, arg_seq_len, emb_dim, emb_dim/q_heads);
+        auto rope_rp = copy_changed_layout(q_out_rot, arg_seq_len, emb_dim, emb_dim/q_heads);
+        auto attn_softmax_rp = copy_changed_layout(attn_weights_softmax_ref, arg_seq_len, arg_seq_len);
+        auto inp_rp = copy_changed_layout(inp, arg_seq_len, emb_dim);
+        auto rms_g1_rp = copy_changed_layout(rms_g1, 1, emb_dim);
+        auto rms_g2_rp = copy_changed_layout(rms_g2, 1, emb_dim);
 
         int D_mlp = W_gate.size() / emb_dim;
         vector<float> after_attn(arg_seq_len * emb_dim);
@@ -985,40 +1228,28 @@ int main(int argc, char** argv) {
         vector<float> mlp_out(arg_seq_len * emb_dim);
 
         residual = (layer) ? residual : inp;
+        residual_rp = (layer) ? residual_rp : inp_rp;
 
         // 1. RMSNorm: inp → attn_inp
         auto attn_inp = rmsnorm(residual, rms_g1, seq_len, emb_dim);
 
-        // compare_tensors(attn_inp_ref, attn_inp, "attn_inp", arg_seq_len*emb_dim, tol);
-        if (layer == 0){
-            attn_inp = attn_inp_ref;
-        }
+        compare_tensors(attn_inp_ref, attn_inp, "attn_inp", arg_seq_len*emb_dim, tol);
+
         // 2. Attention: attn_inp → attn_out
         init = clock();
-        auto attn_out = multi_head_attention(attn_inp_ref, Wq, Wk, Wv, Wo, sin_cache, cos_cache, mask, arg_seq_len, emb_dim, q_heads, kv_heads);
+        auto attn_out = multi_head_attention(attn_inp, Wq, Wk, Wv, Wo, sin_cache, cos_cache, mask, arg_seq_len, emb_dim, q_heads, kv_heads);
         end = clock();
-        naive_time = (double)(end - init) / CLOCKS_PER_SEC * 1000;
+        naive_time_attn = (double)(end - init) / CLOCKS_PER_SEC * 1000;
         compare_tensors(attn_out_ref, attn_out, "attn_out", arg_seq_len*emb_dim, tol);
-        init = clock();
-        attn_out = multi_head_attention_blas(attn_inp_ref, Wq, Wk, Wv, Wo, sin_cache, cos_cache, sin_t, cos_t, mask_t, q_t, rope_t, attn_softmax_t, arg_seq_len, emb_dim, q_heads, kv_heads);
-        end = clock();
-        new_time = (double)(end - init) / CLOCKS_PER_SEC * 1000;
-        spd_attn += (100*(naive_time-new_time)/naive_time);
-        compare_tensors(attn_out_ref, attn_out, "attn_out", arg_seq_len*emb_dim, tol);
-
-
-        printf("Naive Attention time: %.2f ms\n", naive_time);
-        printf("New Attention time: %.2f ms\n", new_time);
-        break;
 
         // 3. Residual add: inp + attn_out
         for (int i = 0; i < arg_seq_len * emb_dim; ++i)
-            after_attn[i] = inp[i] + attn_out[i];
-        // compare_tensors(inp_norm2, after_attn, "after_attn", arg_seq_len*emb_dim, tol);
+            after_attn[i] = residual[i] + attn_out[i];
+        compare_tensors(inp_norm2, after_attn, "after_attn", arg_seq_len*emb_dim, tol);
 
         // 4. RMSNorm: after_attn → mlp_inp
         auto mlp_inp = rmsnorm(after_attn, rms_g2, arg_seq_len, emb_dim);
-        // compare_tensors(mlp_inp_ref, mlp_inp, "mlp_inp", arg_seq_len*emb_dim, tol);
+        compare_tensors(mlp_inp_ref, mlp_inp, "mlp_inp", arg_seq_len*emb_dim, tol);
 
         // 5. MLP: mlp_inp → mlp_out
         init = clock();
@@ -1036,9 +1267,9 @@ int main(int argc, char** argv) {
             W_up.data(), emb_dim,
             beta,
             up.data(), D_mlp);
-        // compare_tensors(up_proj_out, up, "up_proj_out", arg_seq_len*D_mlp, tol);
+        compare_tensors(up_proj_out, up, "up_proj_out", arg_seq_len*D_mlp, tol);
         silu_inplace(gate);
-        // compare_tensors(gate_proj_out, gate, "gate_proj_out", arg_seq_len*D_mlp, tol);
+        compare_tensors(gate_proj_out, gate, "gate_proj_out", arg_seq_len*D_mlp, tol);
         auto fused = mul(gate, up);
         matmul(CblasRowMajor, CblasNoTrans, CblasTrans,
             arg_seq_len, emb_dim, D_mlp,
@@ -1048,9 +1279,51 @@ int main(int argc, char** argv) {
             beta,
             mlp_out.data(), emb_dim);
         end = clock();
-        naive_time = (double)(init - end) / CLOCKS_PER_SEC * 1000;
-        // compare_tensors(mlp_out_ref, mlp_out, "mlp_out", arg_seq_len*emb_dim, tol);
+        naive_time_mlp = (double)(init - end) / CLOCKS_PER_SEC * 1000;
+        compare_tensors(mlp_out_ref, mlp_out, "mlp_out", arg_seq_len*emb_dim, tol);
 
+        // 6. Residual add: after_attn + mlp_out → out
+        vector<float> out(arg_seq_len * emb_dim);
+        for (int i = 0; i < arg_seq_len * emb_dim; ++i)
+            out[i] = after_attn[i] + mlp_out[i];
+        compare_tensors(out_ref, out, "out", arg_seq_len*emb_dim, tol);
+
+        residual = move(out);
+
+
+        auto transposed_attn_inp = copy_changed_layout(attn_inp, arg_seq_len, emb_dim);
+        auto transposed_attn_out = copy_changed_layout(attn_out, arg_seq_len, emb_dim);
+        auto transposed_inp_norm2 = copy_changed_layout(inp_norm2, arg_seq_len, emb_dim);
+        auto transposed_mlp_inp_ref = copy_changed_layout(mlp_inp_ref, arg_seq_len, emb_dim);
+        auto transposed_up_proj_out = copy_changed_layout(up_proj_out, arg_seq_len, D_mlp);
+        auto transposed_gate_proj_out = copy_changed_layout(gate_proj_out, arg_seq_len, D_mlp);
+        auto transposed_out_ref = copy_changed_layout(out_ref, arg_seq_len, emb_dim);
+
+        // ==========================RP-GEMM==========================
+        printf("\n=== RP-GEMM LAYER %d ===\n", layer);
+
+        // 1. RMSNorm: inp → attn_inp
+        attn_inp = rmsnorm_packed(residual_rp, rms_g1, arg_seq_len, emb_dim);
+
+        compare_tensors(transposed_attn_inp, attn_inp, "attn_inp", arg_seq_len*emb_dim, tol);
+
+        // 2. Attention: attn_inp → attn_out
+        init = clock();
+        auto attn_out_rp = multi_head_attention_blas(attn_inp, Wq, Wk, Wv, Wo, sin_cache, cos_cache, sin_rp, cos_rp, mask_rp, q_rp, rope_rp, attn_softmax_rp, arg_seq_len, emb_dim, q_heads, kv_heads);
+        end = clock();
+        new_time_attn = (double)(end - init) / CLOCKS_PER_SEC * 1000;
+        spd_attn += (100*(naive_time_attn-new_time_attn)/naive_time_attn);
+        compare_tensors(transposed_attn_out, attn_out_rp, "attn_out", arg_seq_len*emb_dim, tol);
+        // 3. Residual add: inp + attn_out
+        for (int i = 0; i < arg_seq_len * emb_dim; ++i)
+            after_attn[i] = residual_rp[i] + attn_out_rp[i];
+        compare_tensors(transposed_inp_norm2, after_attn, "after_attn", arg_seq_len*emb_dim, tol);
+
+        // 4. RMSNorm: after_attn → mlp_inp
+        mlp_inp = rmsnorm_packed(after_attn, rms_g2_rp, arg_seq_len, emb_dim);
+        compare_tensors(transposed_mlp_inp_ref, mlp_inp, "mlp_inp", arg_seq_len*emb_dim, tol);
+
+        // 5. MLP: mlp_inp → mlp_out
         init = clock();
         gemm_seq(CblasRowMajor, CblasNoTrans, CblasTrans, CblasMid,
             arg_seq_len, D_mlp, emb_dim,
@@ -1068,7 +1341,9 @@ int main(int argc, char** argv) {
             beta,
             up.data(), D_mlp,
             -1, 0);
+        compare_tensors(transposed_up_proj_out, up, "up_proj_out", arg_seq_len*D_mlp, tol);
         silu_inplace(gate);
+        compare_tensors(transposed_gate_proj_out, gate, "gate_proj_out", arg_seq_len*D_mlp, tol);
         fused = mul(gate, up);
         gemm_seq(CblasRowMajor, CblasNoTrans, CblasTrans, CblasMid,
             arg_seq_len, emb_dim, D_mlp,
@@ -1079,16 +1354,16 @@ int main(int argc, char** argv) {
             mlp_out.data(), emb_dim,
             -1, 0);
         end = clock();
-        new_time = (double)(init - end) / CLOCKS_PER_SEC * 1000;
-        spd_mlp += (int)(100*(naive_time-new_time)/naive_time);
+        new_time_mlp = (double)(init - end) / CLOCKS_PER_SEC * 1000;
+        spd_mlp += (int)(100*(naive_time_mlp-new_time_mlp)/naive_time_mlp);
 
         // 6. Residual add: after_attn + mlp_out → out
-        vector<float> out(arg_seq_len * emb_dim);
+        vector<float> out_rp(arg_seq_len * emb_dim);
         for (int i = 0; i < arg_seq_len * emb_dim; ++i)
-            out[i] = after_attn[i] + mlp_out_ref[i];
-        // compare_tensors(out_ref, out, "out", arg_seq_len*emb_dim, tol);
+            out_rp[i] = after_attn[i] + mlp_out[i];
+        compare_tensors(transposed_out_ref, out_rp, "out", arg_seq_len*emb_dim, tol);
 
-        residual = move(out);
+        residual_rp = move(out_rp);
     }
     printf("Speedup (Attention): %d%\n", (int)(spd_attn/N));
     printf("Speedup (MLP): %d%\n", (int)(spd_mlp/N));

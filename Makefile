@@ -1,5 +1,5 @@
 CC          = g++
-CFLAGS      = -g -fopenmp -march=skylake-avx512 -Iinclude
+CFLAGS      = -g -fopenmp -Iinclude
 LIBDIR      = include
 LDFLAGS     = -L$(LIBDIR) -lgemm -lm -fopenmp
 
